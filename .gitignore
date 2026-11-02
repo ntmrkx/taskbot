@@ -1,0 +1,12 @@
+# секреты: НИКОГДА не загружать
+start.sh
+bot.env
+*.pem
+
+# личные данные
+tasks.db
+
+# мусор Python и macOS
+venv/
+__pycache__/
+.DS_Store
