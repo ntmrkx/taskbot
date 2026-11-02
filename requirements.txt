@@ -1,3 +1,5 @@
 python-telegram-bot[job-queue]>=21.0,<22
 anthropic
+icalendar
+recurring-ical-events
 tzdata

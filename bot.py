@@ -8,6 +8,7 @@ Commands:
   /done <id>                      mark a task as done
   /delete <id>                    delete a task
   /checkmail                      check email right now
+  /schedule [когда]               classes for a day (also /rozvrh)
   /help                           show help
 
 <когда>: сегодня/today, завтра/tomorrow, пн..вс / mon..sun, 20.11., 20.11.2026, 2026-11-20
@@ -26,6 +27,8 @@ Environment variables:
   GMAIL_APP_PASSWORD   16-letter Google app password            (needed for email)
   ANTHROPIC_API_KEY    API key from console.anthropic.com       (needed for email)
   CLAUDE_MODEL         optional, default "claude-haiku-5-5"
+  TIMETABLE_URL        Sirius iCalendar export link (optional, keep it secret)
+  CLASS_REMIND_MINUTES remind N minutes before each class (optional, 0 = off)
 """
 import asyncio
 import email
@@ -36,12 +39,15 @@ import logging
 import os
 import re
 import sqlite3
+import urllib.request
 from contextlib import contextmanager
 from datetime import date, datetime, time as dtime, timedelta
 from email import policy
 from zoneinfo import ZoneInfo
 
 import anthropic
+import icalendar
+import recurring_ical_events
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import Application, CallbackQueryHandler, CommandHandler, ContextTypes, Defaults
 
@@ -53,6 +59,8 @@ GMAIL_APP_PASSWORD = os.environ.get("GMAIL_APP_PASSWORD", "").replace(" ", "")
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "").strip()
 CLAUDE_MODEL = os.environ.get("CLAUDE_MODEL", "claude-haiku-5-5")
 MAIL_ENABLED = bool(GMAIL_ADDRESS and GMAIL_APP_PASSWORD and ANTHROPIC_API_KEY)
+TIMETABLE_URL = os.environ.get("TIMETABLE_URL", "").strip()
+CLASS_REMIND_MINUTES = int(os.environ.get("CLASS_REMIND_MINUTES", "0") or 0)
 
 TZ = ZoneInfo("Europe/Prague")
 DB_PATH = "tasks.db"
@@ -61,6 +69,8 @@ CHECK_EVERY = 60                       # seconds between reminder checks
 MAIL_CHECK_EVERY = 300                 # seconds between email checks
 MAX_EMAILS_PER_CHECK = 10
 MAX_BODY_CHARS = 8000                  # longer emails are cut (saves API money)
+TIMETABLE_FILE = "timetable.ics"       # local copy, so the bot works even if Sirius is down
+TIMETABLE_REFRESH = 6 * 3600           # seconds between timetable downloads
 
 WEEKDAYS = {
     "mon": 0, "monday": 0, "пн": 0, "понедельник": 0,
@@ -89,7 +99,8 @@ HELP = (
     "/today — просроченные, сегодня и завтра\n"
     "/done <id> — отметить выполненной\n"
     "/delete <id> — удалить задачу\n"
-    "/checkmail — проверить почту сейчас\n\n"
+    "/checkmail — проверить почту сейчас\n"
+    "/schedule [когда] — пары на день (по умолчанию сегодня)\n\n"
     "<когда>: сегодня, завтра, пн–вс, 20.11., 20.11.2026\n\n"
     + EXAMPLES
 )
@@ -101,6 +112,9 @@ logging.getLogger("apscheduler").setLevel(logging.WARNING)  # hide "job executed
 ai = anthropic.AsyncAnthropic(api_key=ANTHROPIC_API_KEY) if MAIL_ENABLED else None
 MAIL_LOCK = asyncio.Lock()
 last_mail_error = None
+last_timetable_error = None
+_calendar = None           # parsed timetable, cached in memory
+_class_reminded = set()    # classes already reminded about (since the bot started)
 
 # ---------- database ----------
 
@@ -242,6 +256,9 @@ def summary_text():
             due_tomorrow.append(f"#{r['id']} {r['title']}{at}")
 
     parts = []
+    classes = safe_classes_on(today)
+    if classes:
+        parts.append("🎓 Пары сегодня:\n" + "\n".join(fmt_class(c) for c in classes))
     if overdue:
         parts.append("⚠️ Просрочено:\n" + "\n".join(overdue))
     if due_today:
@@ -427,6 +444,112 @@ async def mail_job(context: ContextTypes.DEFAULT_TYPE):
         last_mail_error = str(e)
 
 
+# ---------- timetable (Sirius .ics) ----------
+
+
+def download_timetable():
+    """Runs in a separate thread. Downloads the .ics, checks that it parses, saves it."""
+    global _calendar
+    req = urllib.request.Request(TIMETABLE_URL, headers={"User-Agent": "taskbot"})
+    with urllib.request.urlopen(req, timeout=30) as resp:
+        data = resp.read()
+    cal = icalendar.Calendar.from_ical(data)  # raises if it's not a valid calendar
+    tmp = TIMETABLE_FILE + ".tmp"
+    with open(tmp, "wb") as f:
+        f.write(data)
+    os.replace(tmp, TIMETABLE_FILE)  # replace the old copy only after a good download
+    _calendar = cal
+
+
+def load_calendar():
+    global _calendar
+    if _calendar is None and os.path.exists(TIMETABLE_FILE):
+        with open(TIMETABLE_FILE, "rb") as f:
+            _calendar = icalendar.Calendar.from_ical(f.read())
+    return _calendar
+
+
+def to_local(value):
+    """iCal times can be dates (all-day events), naive or timezone-aware datetimes."""
+    if isinstance(value, datetime):
+        return value.replace(tzinfo=TZ) if value.tzinfo is None else value.astimezone(TZ)
+    return datetime.combine(value, dtime(0, 0), tzinfo=TZ)
+
+
+def classes_between(start, end):
+    cal = load_calendar()
+    if cal is None:
+        return []
+    result = []
+    for ev in recurring_ical_events.of(cal).between(start, end):
+        dtstart = ev.get("DTSTART")
+        if dtstart is None:
+            continue
+        s = to_local(dtstart.dt)
+        dtend = ev.get("DTEND")
+        result.append({
+            "start": s,
+            "end": to_local(dtend.dt) if dtend is not None else s,
+            "all_day": not isinstance(dtstart.dt, datetime),
+            "title": str(ev.get("SUMMARY", "")).strip() or "(без названия)",
+            "location": str(ev.get("LOCATION", "") or "").strip(),
+        })
+    result.sort(key=lambda c: c["start"])
+    return result
+
+
+def safe_classes_on(day):
+    """Classes on one day. Never crashes the caller (e.g. the morning summary)."""
+    try:
+        start = datetime.combine(day, dtime(0, 0), tzinfo=TZ)
+        return classes_between(start, start + timedelta(days=1))
+    except Exception:
+        logging.exception("Could not read timetable")
+        return []
+
+
+def fmt_class(c):
+    where = f" · {c['location']}" if c["location"] else ""
+    if c["all_day"]:
+        return f"весь день: {c['title']}{where}"
+    return f"{c['start']:%H:%M}–{c['end']:%H:%M} {c['title']}{where}"
+
+
+async def timetable_job(context: ContextTypes.DEFAULT_TYPE):
+    global last_timetable_error
+    try:
+        await asyncio.to_thread(download_timetable)
+        logging.info("Timetable updated.")
+        last_timetable_error = None
+    except Exception as e:
+        logging.warning("Timetable download failed: %s", e)
+        owner = get_owner()
+        if owner and str(e) != last_timetable_error:  # tell you once, not every time
+            await context.bot.send_message(owner, f"⚠️ Не удалось обновить расписание:\n{e}")
+        last_timetable_error = str(e)
+
+
+async def class_reminder_job(context: ContextTypes.DEFAULT_TYPE):
+    owner = get_owner()
+    if owner is None:
+        return
+    n = now()
+    lead = timedelta(minutes=CLASS_REMIND_MINUTES)
+    try:
+        upcoming = classes_between(n, n + lead + timedelta(minutes=1))
+    except Exception:
+        logging.exception("Could not read timetable")
+        return
+    for c in upcoming:
+        if c["all_day"] or not (c["start"] - lead <= n < c["start"]):
+            continue
+        key = (c["title"], c["start"].isoformat())
+        if key in _class_reminded:
+            continue
+        _class_reminded.add(key)
+        await context.bot.send_message(owner, f"🎓 Скоро пара:\n{fmt_class(c)}")
+
+
 # ---------- commands ----------
 
 
@@ -541,6 +664,27 @@ async def checkmail_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Новых писем нет.")
 
 
+async def schedule_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await is_owner(update):
+        return
+    if not TIMETABLE_URL:
+        await update.message.reply_text("Расписание не настроено: нужен TIMETABLE_URL.")
+        return
+    day = parse_date(context.args[0]) if context.args else now().date()
+    if day is None:
+        await update.message.reply_text("Не понимаю дату. Пример: /schedule завтра")
+        return
+    if load_calendar() is None:
+        await update.message.reply_text("Расписание ещё не загружено, попробуй через минуту.")
+        return
+    classes = safe_classes_on(day)
+    header = f"🎓 {DAY_NAMES[day.weekday()]} {day:%d.%m.}"
+    if classes:
+        await update.message.reply_text(header + ":\n" + "\n".join(fmt_class(c) for c in classes))
+    else:
+        await update.message.reply_text(header + ": пар нет 🎉")
+
+
 async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Someone pressed a "➕ add task" button under an email summary."""
     query = update.callback_query
@@ -619,6 +763,7 @@ def main():
     app.add_handler(CommandHandler("done", done))
     app.add_handler(CommandHandler("delete", delete))
     app.add_handler(CommandHandler("checkmail", checkmail_cmd))
+    app.add_handler(CommandHandler(["schedule", "rozvrh"], schedule_cmd))
     app.add_handler(CallbackQueryHandler(on_button))
 
     app.job_queue.run_repeating(check_reminders, interval=CHECK_EVERY, first=5)
@@ -628,6 +773,14 @@ def main():
         logging.info("Email checking is ON (%s, model %s).", GMAIL_ADDRESS, CLAUDE_MODEL)
     else:
         logging.info("Email checking is OFF (set GMAIL_ADDRESS, GMAIL_APP_PASSWORD, ANTHROPIC_API_KEY).")
+
+    if TIMETABLE_URL:
+        app.job_queue.run_repeating(timetable_job, interval=TIMETABLE_REFRESH, first=10)
+        if CLASS_REMIND_MINUTES > 0:
+            app.job_queue.run_repeating(class_reminder_job, interval=60, first=20)
+        logging.info("Timetable is ON (class reminders: %s min before).", CLASS_REMIND_MINUTES or "off")
+    else:
+        logging.info("Timetable is OFF (set TIMETABLE_URL).")
 
     logging.info("Bot is running. Press Ctrl+C to stop.")
     app.run_polling()
