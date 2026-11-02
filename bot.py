@@ -1,11 +1,14 @@
 """
-Personal task & reminder bot for Telegram  (v2: + school email summaries)
+Personal task & reminder bot for Telegram  (v3: + timetable, repeating tasks, buttons)
 
 Commands:
   /add <когда> [ЧЧ:ММ] <задача>   add a task
   /list                           all open tasks
   /today                          overdue + today + tomorrow
-  /done <id>                      mark a task as done
+  /every <правило> [ЧЧ:ММ] <задача>  repeating task (день / пн..вс / 15)
+  /done <id>                      mark a task as done (repeating: moves to next time)
+  /edit <id> <когда> [ЧЧ:ММ]      move a task to another date/time
+  /rename <id> <новое название>   rename a task
   /delete <id>                    delete a task
   /checkmail                      check email right now
   /schedule [когда]               classes for a day (also /rozvrh)
@@ -17,6 +20,8 @@ Reminders:
   - tasks with a time:    1 day before and 1 hour before
   - tasks without a time: 2 days before (at 9:00)
   - every morning at 8:00: summary of overdue, today and tomorrow
+  - reminders have buttons: done / remind in 1 hour / remind tomorrow
+  - every Sunday at 19:00: weekly summary
 
 Email (optional): every 5 minutes the bot reads new mail in Gmail, asks Claude
 for a short summary and sends it to Telegram with "add task" buttons.
@@ -65,6 +70,7 @@ CLASS_REMIND_MINUTES = int(os.environ.get("CLASS_REMIND_MINUTES", "0") or 0)
 TZ = ZoneInfo("Europe/Prague")
 DB_PATH = "tasks.db"
 SUMMARY_TIME = dtime(8, 0, tzinfo=TZ)  # daily morning summary
+WEEKLY_TIME = dtime(19, 0, tzinfo=TZ)  # weekly summary (on Sundays)
 CHECK_EVERY = 60                       # seconds between reminder checks
 MAIL_CHECK_EVERY = 300                 # seconds between email checks
 MAX_EMAILS_PER_CHECK = 10
@@ -84,6 +90,10 @@ WEEKDAYS = {
 TODAY_WORDS = {"today", "сегодня"}
 TOMORROW_WORDS = {"tomorrow", "завтра"}
 DAY_NAMES = ["пн", "вт", "ср", "чт", "пт", "сб", "вс"]
+ON_DAYS = ["по понедельникам", "по вторникам", "по средам", "по четвергам",
+           "по пятницам", "по субботам", "по воскресеньям"]
+DAILY_WORDS = {"день", "ежедневно", "day", "daily"}
+EVERY_WORDS = {"каждый", "каждую", "каждое", "every"}  # optional, "/every каждый вт ..." also works
 
 EXAMPLES = (
     "Примеры:\n"
@@ -97,12 +107,23 @@ HELP = (
     "/add <когда> [ЧЧ:ММ] <задача> — добавить задачу\n"
     "/list — все открытые задачи\n"
     "/today — просроченные, сегодня и завтра\n"
+    "/every <правило> [ЧЧ:ММ] <задача> — повторяющаяся задача\n"
+    "   правило: день, пн–вс или число месяца (15)\n"
     "/done <id> — отметить выполненной\n"
+    "/edit <id> <когда> [ЧЧ:ММ] — перенести задачу\n"
+    "/rename <id> <название> — переименовать\n"
     "/delete <id> — удалить задачу\n"
     "/checkmail — проверить почту сейчас\n"
     "/schedule [когда] — пары на день (по умолчанию сегодня)\n\n"
     "<когда>: сегодня, завтра, пн–вс, 20.11., 20.11.2026\n\n"
     + EXAMPLES
+    + "\n/every вт Вынести мусор\n/every 1 10:00 Оплатить телефон"
+)
+USAGE_EVERY = (
+    "Формат: /every <правило> [ЧЧ:ММ] <задача>\n"
+    "Правило: день (каждый день), пн–вс (каждую неделю) или число месяца.\n"
+    "Примеры:\n/every вт Вынести мусор\n/every день 22:00 Выпить таблетку\n"
+    "/every 1 10:00 Оплатить телефон"
 )
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -142,6 +163,18 @@ def init_db():
                 sent     TEXT NOT NULL DEFAULT ''   -- reminders already sent, e.g. "1d,1h"
             )""")
         con.execute("CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT)")
+        # columns added in v3 (older databases get them added automatically)
+        cols = {row["name"] for row in con.execute("PRAGMA table_info(tasks)")}
+        if "repeat" not in cols:
+            con.execute("ALTER TABLE tasks ADD COLUMN repeat TEXT")        # e.g. "weekly:1"
+        if "snooze_until" not in cols:
+            con.execute("ALTER TABLE tasks ADD COLUMN snooze_until TEXT")  # extra reminder time
+        con.execute("""
+            CREATE TABLE IF NOT EXISTS completions (  -- history for the weekly summary
+                id      INTEGER PRIMARY KEY AUTOINCREMENT,
+                title   TEXT NOT NULL,
+                done_at TEXT NOT NULL
+            )""")
         con.execute("""
             CREATE TABLE IF NOT EXISTS suggestions (  -- deadlines found in emails, waiting for a button press
                 id       INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -181,16 +214,123 @@ def reminder_times(due, has_time):
     return {"2d": two_days_before}  # the day itself is covered by the morning summary
 
 
-def insert_task(title, due, has_time):
+def initial_sent(due, has_time):
     # Reminders whose moment has already passed are marked as sent,
     # so adding a task for tomorrow doesn't fire the "1 day before" reminder instantly.
-    sent = ",".join(k for k, when in reminder_times(due, has_time).items() if when <= now())
+    return ",".join(k for k, when in reminder_times(due, has_time).items() if when <= now())
+
+
+def insert_task(title, due, has_time, repeat=None):
     with db() as con:
         cur = con.execute(
-            "INSERT INTO tasks (title, due, has_time, sent) VALUES (?, ?, ?, ?)",
-            (title, due.isoformat(), int(has_time), sent),
+            "INSERT INTO tasks (title, due, has_time, sent, repeat) VALUES (?, ?, ?, ?, ?)",
+            (title, due.isoformat(), int(has_time), initial_sent(due, has_time), repeat),
         )
         return cur.lastrowid
+
+
+def complete_task(task_id):
+    """Mark a task done. A repeating task moves to its next time instead.
+    Returns (row, next_due) or None if there is no such open task."""
+    with db() as con:
+        row = con.execute("SELECT * FROM tasks WHERE id = ? AND done = 0", (task_id,)).fetchone()
+        if row is None:
+            return None
+        con.execute("INSERT INTO completions (title, done_at) VALUES (?, ?)", (row["title"], now().isoformat()))
+        if not row["repeat"]:
+            con.execute("UPDATE tasks SET done = 1, snooze_until = NULL WHERE id = ?", (task_id,))
+            return row, None
+        old = due_of(row)
+        t = old.time() if row["has_time"] else None
+        nxt = next_due(row["repeat"], max(now(), old), t)
+        con.execute(
+            "UPDATE tasks SET due = ?, sent = ?, snooze_until = NULL WHERE id = ?",
+            (nxt.isoformat(), initial_sent(nxt, row["has_time"]), task_id),
+        )
+        return row, nxt
+
+
+def snooze_task(task_id, until):
+    with db() as con:
+        row = con.execute("SELECT title FROM tasks WHERE id = ? AND done = 0", (task_id,)).fetchone()
+        if row:
+            con.execute("UPDATE tasks SET snooze_until = ? WHERE id = ?", (until.isoformat(), task_id))
+    return row
+
+
+# ---------- repeating tasks ----------
+
+
+def parse_rule(args):
+    """Reads the repeat rule from the start of /every arguments.
+    Returns (rule, number_of_words_used) or (None, 0)."""
+    i = 1 if args and args[0].lower() in EVERY_WORDS else 0
+    if i >= len(args):
+        return None, 0
+    w = args[i].lower()
+    if w in DAILY_WORDS:
+        return "daily", i + 1
+    if w in WEEKDAYS:
+        return f"weekly:{WEEKDAYS[w]}", i + 1
+    m = re.fullmatch(r"(\d{1,2})(?:-?е|-?го|\.)?", w)
+    if m and 1 <= int(m[1]) <= 31:
+        used = i + 1
+        if used < len(args) and args[used].lower() in ("число", "числа"):
+            used += 1
+        return f"monthly:{int(m[1])}", used
+    return None, 0
+
+
+def last_day_of_month(day):
+    first_next = (day.replace(day=28) + timedelta(days=4)).replace(day=1)
+    return (first_next - timedelta(days=1)).day
+
+
+def rule_matches(rule, day):
+    kind, _, value = rule.partition(":")
+    if kind == "daily":
+        return True
+    if kind == "weekly":
+        return day.weekday() == int(value)
+    if kind == "monthly":  # "31" means the last day in shorter months
+        return day.day == min(int(value), last_day_of_month(day))
+    return False
+
+
+def next_due(rule, after, t):
+    """First time matching the rule that is strictly later than `after`."""
+    for i in range(0, 400):
+        day = after.date() + timedelta(days=i)
+        if rule_matches(rule, day):
+            due = datetime.combine(day, t or dtime(23, 59), tzinfo=TZ)
+            if due > after:
+                return due
+    raise ValueError(f"bad repeat rule: {rule}")
+
+
+def fmt_rule(rule):
+    kind, _, value = rule.partition(":")
+    if kind == "daily":
+        return "каждый день"
+    if kind == "weekly":
+        return ON_DAYS[int(value)]
+    if kind == "monthly":
+        return f"каждое {value}-е число"
+    return rule
+
+
+def reminder_buttons(task_id):
+    return InlineKeyboardMarkup([[
+        InlineKeyboardButton("✅ Готово", callback_data=f"done:{task_id}"),
+        InlineKeyboardButton("⏰ Через час", callback_data=f"snz:{task_id}:1h"),
+        InlineKeyboardButton("📅 Завтра", callback_data=f"snz:{task_id}:tmr"),
+    ]])
+
+
+def done_text(row, nxt):
+    if nxt is None:
+        return f"🎉 Выполнено: {row['title']}"
+    return f"🎉 Выполнено: {row['title']}\n🔁 Следующий раз: {fmt_due(nxt, row['has_time'])}"
 
 
 # ---------- helpers ----------
@@ -609,7 +749,8 @@ async def list_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     for r in rows:
         due = due_of(r)
         mark = "⚠️ " if due < n else ""
-        lines.append(f"{mark}#{r['id']} {r['title']} — {fmt_due(due, r['has_time'])}")
+        rep = f" 🔁 {fmt_rule(r['repeat'])}" if r["repeat"] else ""
+        lines.append(f"{mark}#{r['id']} {r['title']} — {fmt_due(due, r['has_time'])}{rep}")
     await update.message.reply_text("Твои задачи:\n" + "\n".join(lines))
 
 
@@ -625,11 +766,74 @@ async def done(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if task_id is None:
         await update.message.reply_text("Формат: /done <id>  (id есть в /list)")
         return
+    result = complete_task(task_id)
+    await update.message.reply_text(done_text(*result) if result else f"Нет открытой задачи #{task_id}.")
+
+
+async def every(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await is_owner(update):
+        return
+    args = context.args
+    rule, used = parse_rule(args)
+    if rule is None:
+        await update.message.reply_text(USAGE_EVERY)
+        return
+    rest = args[used:]
+    t = parse_time(rest[0]) if rest else None
+    title = " ".join(rest[1:] if t else rest).strip()
+    if not title:
+        await update.message.reply_text("А какая задача? 🙂\n\n" + USAGE_EVERY)
+        return
+    has_time = t is not None
+    due = next_due(rule, now(), t)
+    task_id = insert_task(title, due, has_time, repeat=rule)
+    await update.message.reply_text(
+        f"🔁 Добавлено #{task_id}: {title}\n{fmt_rule(rule).capitalize()}, ближайший раз: {fmt_due(due, has_time)}"
+    )
+
+
+async def edit_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await is_owner(update):
+        return
+    args = context.args
+    usage = "Формат: /edit <id> <когда> [ЧЧ:ММ]\nПример: /edit 5 пт 18:00"
+    task_id = parse_id(context)
+    d = parse_date(args[1]) if task_id is not None and len(args) > 1 else None
+    if d is None:
+        await update.message.reply_text(usage)
+        return
+    t = parse_time(args[2]) if len(args) > 2 else None
+    has_time = t is not None
+    due = datetime.combine(d, t or dtime(23, 59), tzinfo=TZ)
+    if due < now():
+        await update.message.reply_text("Это время уже прошло 🤔")
+        return
     with db() as con:
         row = con.execute("SELECT title FROM tasks WHERE id = ? AND done = 0", (task_id,)).fetchone()
         if row:
-            con.execute("UPDATE tasks SET done = 1 WHERE id = ?", (task_id,))
-    await update.message.reply_text(f"🎉 Выполнено: {row['title']}" if row else f"Нет открытой задачи #{task_id}.")
+            con.execute(
+                "UPDATE tasks SET due = ?, has_time = ?, sent = ?, snooze_until = NULL WHERE id = ?",
+                (due.isoformat(), int(has_time), initial_sent(due, has_time), task_id),
+            )
+    if row is None:
+        await update.message.reply_text(f"Нет открытой задачи #{task_id}.")
+        return
+    await update.message.reply_text(f"✏️ Перенесено #{task_id}: {row['title']}\n📅 {fmt_due(due, has_time)}")
+
+
+async def rename_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await is_owner(update):
+        return
+    task_id = parse_id(context)
+    title = " ".join(context.args[1:]).strip() if task_id is not None else ""
+    if not title:
+        await update.message.reply_text("Формат: /rename <id> <новое название>")
+        return
+    with db() as con:
+        cur = con.execute("UPDATE tasks SET title = ? WHERE id = ? AND done = 0", (title[:200], task_id))
+    await update.message.reply_text(
+        f"✏️ Переименовано #{task_id}: {title}" if cur.rowcount else f"Нет открытой задачи #{task_id}."
+    )
 
 
 async def delete(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -686,12 +890,18 @@ async def schedule_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Someone pressed a "➕ add task" button under an email summary."""
+    """All inline buttons: "➕ add task" under emails, "✅ / ⏰ / 📅" under reminders."""
     query = update.callback_query
     if query.message.chat.id != get_owner():
         await query.answer()
         return
     action, _, sid = query.data.partition(":")
+    if action == "done":
+        await on_done_button(query, sid)
+        return
+    if action == "snz":
+        await on_snooze_button(query, sid)
+        return
     if action != "add" or not sid.isdigit():
         await query.answer()
         return
@@ -713,6 +923,42 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.message.reply_text(f"✅ Добавлено #{task_id}: {row['title']}\n📅 {fmt_due(due, row['has_time'])}")
 
 
+async def close_buttons(query, note):
+    """Remove the buttons and add a short note under the original message."""
+    try:
+        await query.edit_message_text(f"{query.message.text}\n\n{note}")
+    except Exception:  # e.g. message too old to edit
+        await query.message.reply_text(note)
+
+
+async def on_done_button(query, sid):
+    result = complete_task(int(sid)) if sid.isdigit() else None
+    if result is None:
+        await query.answer("Задача уже закрыта или удалена")
+        await close_buttons(query, "ℹ️ Задача уже закрыта")
+        return
+    await query.answer("Готово ✅")
+    await close_buttons(query, done_text(*result))
+
+
+async def on_snooze_button(query, data):
+    sid, _, how = data.partition(":")
+    if not sid.isdigit():
+        await query.answer()
+        return
+    if how == "tmr":
+        until = datetime.combine(now().date() + timedelta(days=1), dtime(9, 0), tzinfo=TZ)
+        note = "📅 Напомню завтра в 9:00"
+    else:
+        until = now() + timedelta(hours=1)
+        note = f"⏰ Напомню в {until:%H:%M}"
+    if snooze_task(int(sid), until) is None:
+        await query.answer("Задача уже закрыта или удалена")
+        return
+    await query.answer("Ок 👍")
+    await close_buttons(query, note)
+
+
 # ---------- scheduled jobs ----------
 
 
@@ -723,6 +969,16 @@ async def check_reminders(context: ContextTypes.DEFAULT_TYPE):
     n = now()
     for r in open_tasks():
         due = due_of(r)
+        rep = "  🔁" if r["repeat"] else ""
+        text = f"⏰ Напоминание: {r['title']}\n📅 {fmt_due(due, r['has_time'])}  (#{r['id']}){rep}"
+
+        # 1) a snoozed reminder ("⏰ через час" / "📅 завтра") is due
+        if r["snooze_until"] and datetime.fromisoformat(r["snooze_until"]) <= n:
+            with db() as con:
+                con.execute("UPDATE tasks SET snooze_until = NULL WHERE id = ?", (r["id"],))
+            await context.bot.send_message(owner, text, reply_markup=reminder_buttons(r["id"]))
+
+        # 2) the normal scheduled reminders
         sent = set(filter(None, r["sent"].split(",")))
         changed = False
         for key, when in reminder_times(due, r["has_time"]).items():
@@ -731,12 +987,43 @@ async def check_reminders(context: ContextTypes.DEFAULT_TYPE):
             sent.add(key)
             changed = True
             if due > n:  # don't send "upcoming" reminders for things already past
-                await context.bot.send_message(
-                    owner, f"⏰ Напоминание: {r['title']}\n📅 {fmt_due(due, r['has_time'])}  (#{r['id']})"
-                )
+                await context.bot.send_message(owner, text, reply_markup=reminder_buttons(r["id"]))
         if changed:
             with db() as con:
                 con.execute("UPDATE tasks SET sent = ? WHERE id = ?", (",".join(sorted(sent)), r["id"]))
+
+
+async def weekly_summary(context: ContextTypes.DEFAULT_TYPE):
+    n = now()
+    owner = get_owner()
+    if owner is None or n.weekday() != 6:  # runs every evening, but only speaks on Sundays
+        return
+    week_ago, week_ahead = n - timedelta(days=7), n + timedelta(days=7)
+    with db() as con:
+        done_rows = con.execute(
+            "SELECT title, done_at FROM completions ORDER BY done_at"
+        ).fetchall()
+    done_titles = [r["title"] for r in done_rows if datetime.fromisoformat(r["done_at"]) >= week_ago]
+
+    tasks = open_tasks()
+    overdue = [r for r in tasks if due_of(r) < n]
+    upcoming = [r for r in tasks if n <= due_of(r) < week_ahead]
+
+    parts = [f"📊 Итоги недели\n\n✅ Выполнено задач: {len(done_titles)}"]
+    if done_titles:
+        shown = done_titles[-10:]
+        parts[0] += "\n" + "\n".join(f"• {t}" for t in shown)
+        if len(done_titles) > len(shown):
+            parts[0] += f"\n…и ещё {len(done_titles) - len(shown)}"
+    if overdue:
+        parts.append("⚠️ Просрочено:\n" + "\n".join(
+            f"#{r['id']} {r['title']} ({fmt_due(due_of(r), r['has_time'])})" for r in overdue))
+    if upcoming:
+        parts.append("📅 На следующей неделе:\n" + "\n".join(
+            f"#{r['id']} {r['title']} — {fmt_due(due_of(r), r['has_time'])}" for r in upcoming))
+    else:
+        parts.append("📅 На следующей неделе задач пока нет.")
+    await context.bot.send_message(owner, "\n\n".join(parts))
 
 
 async def daily_summary(context: ContextTypes.DEFAULT_TYPE):
@@ -761,6 +1048,9 @@ def main():
     app.add_handler(CommandHandler("list", list_cmd))
     app.add_handler(CommandHandler("today", today_cmd))
     app.add_handler(CommandHandler("done", done))
+    app.add_handler(CommandHandler("every", every))
+    app.add_handler(CommandHandler("edit", edit_cmd))
+    app.add_handler(CommandHandler("rename", rename_cmd))
     app.add_handler(CommandHandler("delete", delete))
     app.add_handler(CommandHandler("checkmail", checkmail_cmd))
     app.add_handler(CommandHandler(["schedule", "rozvrh"], schedule_cmd))
@@ -768,6 +1058,7 @@ def main():
 
     app.job_queue.run_repeating(check_reminders, interval=CHECK_EVERY, first=5)
     app.job_queue.run_daily(daily_summary, time=SUMMARY_TIME)
+    app.job_queue.run_daily(weekly_summary, time=WEEKLY_TIME)
     if MAIL_ENABLED:
         app.job_queue.run_repeating(mail_job, interval=MAIL_CHECK_EVERY, first=15)
         logging.info("Email checking is ON (%s, model %s).", GMAIL_ADDRESS, CLAUDE_MODEL)
